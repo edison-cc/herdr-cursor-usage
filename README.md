@@ -1,6 +1,6 @@
 # Cursor usage
 
-A [Herdr](https://herdr.dev) mod that shows the Cursor quota already signed in on this Mac. A **Cursor usage** button in the tab strip opens one dashboard: the included percentage, request quota, or on-demand spend, plus when it resets and whether this pace holds.
+A [Herdr](https://herdr.dev) mod that shows the Cursor quota already signed in on this Mac. A **Usage** button in the tab strip opens one dashboard: the weekly included percent, this month's balance, tokens per day, and AI line edits. Plans without weekly included usage get the included percentage, request quota, or on-demand spend instead.
 
 The numbers come from the same local session and `cursor.com` dashboard calls as [cursor-usage](https://github.com/edison-cc/cursor-usage). Codex and Claude are not part of this mod.
 
