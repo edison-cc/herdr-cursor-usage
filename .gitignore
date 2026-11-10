@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+mods/cursor-usage/jsconfig.json
+mods/cursor-usage/*.d.ts
