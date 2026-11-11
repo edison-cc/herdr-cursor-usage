@@ -4,6 +4,8 @@ A [Herdr](https://herdr.dev) mod that shows the Cursor quota already signed in o
 
 The numbers come from the same local session and `cursor.com` dashboard calls as [cursor-usage](https://github.com/edison-cc/cursor-usage). Codex and Claude are not part of this mod.
 
+![Cursor usage](preview.png)
+
 ## Requirements
 
 - The Herdr app, running
