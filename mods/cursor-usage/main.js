@@ -1,10 +1,12 @@
 // Cursor usage: a toolbar button opens one dashboard tab.
 import { View, div, svg } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
-import { appHome, exec, panes, props, run, settings, spaces, theme } from "herdr";
+import { appHome, exec, panes, props, readTextFile, run, settings, spaces, theme, writeTextFile } from "herdr";
+import { cacheText, cachedReport, claimLock, isFetchInFlight, lockRecord, showCachedThenFetch, FETCH_LIMIT_MS } from "./cache.js";
 import { G, T, button, card, statCell, stateCard, tokens } from "./ui.js";
 
 const EVERY = 5 * 60 * 1000;
+const PULL = 30 * 1000;
 const TAB = { name: "Cursor usage", mod: "cursor-usage" };
 
 function showUsage() {
@@ -46,6 +48,14 @@ async function runCollector() {
       throw startError;
     }
   }
+}
+
+function cachePath() {
+  return `${appHome()}/data/cursor-usage/report.json`;
+}
+
+function lockPath() {
+  return `${appHome()}/data/cursor-usage/fetching`;
 }
 
 async function loadReport() {
@@ -195,27 +205,181 @@ export default class CursorUsage extends View {
     this.width = 0;
     this.barWidth = 0;
     this.series = "all";
-    if (this.toolbarMode) return;
-    this.refresh(cx);
-    cx.timer.every(EVERY, (timerCx) => this.refresh(timerCx));
+    this.cacheText = null;
+    if (this.toolbarMode) {
+      // The button stays on the layout after the usage tab is closed, so this
+      // is the clock that keeps the saved report at most five minutes old.
+      cx.spawn((taskCx) => this.warm(taskCx));
+      cx.timer.every(EVERY, (timerCx) => {
+        timerCx.spawn((taskCx) => this.warm(taskCx));
+      });
+      return;
+    }
+    // The check renders this frame and does not wait. Keep the loading card
+    // until a cache or a live report arrives.
+    this.loading = true;
+    cx.spawn(async (taskCx) => {
+      await this.restore();
+      const files = await this.readFetchFiles();
+      if (isFetchInFlight(files.cacheText, files.lockText, Date.now())) {
+        const startedAt = lockRecord(files.lockText)?.startedAt ?? null;
+        if (this.report) taskCx.notify();
+        await this.waitForCache(taskCx);
+        const arrived = this.updatedAt != null && startedAt != null && this.updatedAt >= startedAt;
+        if (arrived) {
+          this.loading = false;
+          taskCx.notify();
+          return;
+        }
+      }
+      this.loading = false;
+      if (this.report) {
+        taskCx.notify();
+        return;
+      }
+      this.refresh(taskCx);
+    });
+    cx.timer.every(PULL, (timerCx) => {
+      timerCx.spawn((taskCx) => this.pull(taskCx));
+    });
+  }
+
+  async pull(cx) {
+    if (this.loading) return;
+    let text = null;
+    try {
+      text = await readTextFile(cachePath());
+    } catch {
+      return;
+    }
+    const cached = cachedReport(text);
+    if (!cached || cached.savedAt === this.updatedAt) return;
+    if (this.updatedAt != null && cached.savedAt < this.updatedAt) return;
+    this.cacheText = text;
+    this.report = cached.report;
+    this.updatedAt = cached.savedAt;
+    this.error = null;
+    cx.notify();
+  }
+
+  async readFetchFiles() {
+    let cacheText = null;
+    let lockText = null;
+    try {
+      cacheText = await readTextFile(cachePath());
+    } catch {
+      cacheText = null;
+    }
+    try {
+      lockText = await readTextFile(lockPath());
+    } catch {
+      lockText = null;
+    }
+    return { cacheText, lockText };
+  }
+
+  async warm(cx) {
+    const files = await this.readFetchFiles();
+    if (isFetchInFlight(files.cacheText, files.lockText, Date.now())) return;
+    this.cacheText = files.cacheText;
+    await this.collect(cx, false);
+  }
+
+  async waitForCache(cx) {
+    const deadline = Date.now() + FETCH_LIMIT_MS;
+    while (Date.now() < deadline) {
+      const files = await this.readFetchFiles();
+      if (!isFetchInFlight(files.cacheText, files.lockText, Date.now())) break;
+      await cx.sleep(400);
+    }
+    await this.restore();
+  }
+
+  async releaseLock(expected) {
+    try {
+      await writeTextFile(lockPath(), "", expected);
+    } catch {
+      // A leftover lock expires. The next open can take it.
+    }
+  }
+
+  async collect(cx, paint) {
+    const files = await this.readFetchFiles();
+    const claim = claimLock(files.lockText, files.cacheText, Date.now());
+    if (!claim) {
+      if (!paint) return;
+      await this.waitForCache(cx);
+      this.loading = false;
+      cx.notify();
+      return;
+    }
+    let held = null;
+    try {
+      await writeTextFile(lockPath(), claim.text, claim.expected);
+      held = claim.text;
+    } catch {
+      if (!paint) return;
+      await this.waitForCache(cx);
+      this.loading = false;
+      cx.notify();
+      return;
+    }
+    try {
+      if (this.cacheText == null) this.cacheText = files.cacheText;
+      const report = await loadReport();
+      this.report = report;
+      this.error = null;
+      this.updatedAt = Date.now();
+      await this.store();
+    } catch (error) {
+      if (paint) this.error = String(error?.message || error);
+    } finally {
+      if (held) await this.releaseLock(held);
+      if (paint) {
+        this.loading = false;
+        cx.notify();
+      }
+    }
+  }
+
+  async restore() {
+    let text = null;
+    try {
+      text = await readTextFile(cachePath());
+    } catch {
+      return;
+    }
+    showCachedThenFetch(text, (cached) => {
+      this.cacheText = text;
+      this.report = cached.report;
+      this.updatedAt = cached.savedAt;
+      this.error = null;
+    }, () => null);
+  }
+
+  async store() {
+    const next = cacheText(this.report, this.updatedAt);
+    if (next.includes("WorkosCursorSessionToken") || next.includes("cursor-safe-storage:")) return;
+    const path = cachePath();
+    try {
+      await writeTextFile(path, next, this.cacheText);
+      this.cacheText = next;
+    } catch {
+      try {
+        const current = await readTextFile(path);
+        await writeTextFile(path, next, current);
+        this.cacheText = next;
+      } catch {
+        // The cards are already showing. A missed write only slows the next open.
+      }
+    }
   }
 
   refresh(cx) {
     if (this.loading) return;
     this.loading = true;
     cx.notify();
-    cx.spawn(async (taskCx) => {
-      try {
-        this.report = await loadReport();
-        this.error = null;
-        this.updatedAt = Date.now();
-      } catch (error) {
-        this.error = String(error?.message || error);
-      } finally {
-        this.loading = false;
-        taskCx.notify();
-      }
-    });
+    cx.spawn((taskCx) => this.collect(taskCx, true));
   }
 
   toolbar() {

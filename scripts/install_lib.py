@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 OWNER = "cursor-usage"
-OWNED_FILES = ("main.js", "ui.js", "mod.json", "cursor_usage.py", "cursor.svg")
+OWNED_FILES = ("main.js", "ui.js", "cache.js", "mod.json", "cursor_usage.py", "cursor.svg")
 BUTTON_ID = "cursor-usage-toolbar-button"
 NAME = __import__("re").compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]

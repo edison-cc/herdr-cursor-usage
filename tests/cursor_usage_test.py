@@ -3,6 +3,8 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -281,6 +283,62 @@ class MeterTests(unittest.TestCase):
         self.assertEqual(report["meter"]["value"], "10 / 100")
         self.assertNotIn("WorkosCursorSessionToken", result.stdout)
         self.assertNotIn("eyJ", result.stdout)
+
+    def test_independent_calls_overlap_and_dependents_wait(self):
+        events = []
+        inflight = set()
+        lock = threading.Lock()
+
+        def fetch(name, _url, _body, _timeout):
+            with lock:
+                inflight.add(name)
+                events.append(("start", name, frozenset(inflight)))
+            time.sleep(0.05)
+            with lock:
+                inflight.discard(name)
+                events.append(("end", name))
+            if name == "usage":
+                return json.dumps({"gpt-4": {}})
+            if name == "stripe":
+                return json.dumps({"teamId": 7})
+            if name == "usage_status":
+                return json.dumps({
+                    "monthlyUsage": {"periodStart": "2026-11-01T00:00:00Z", "resetsAt": "2026-12-01T00:00:00Z"},
+                })
+            return "{}"
+
+        cursor_usage.fetch_dashboard(fetch)
+        starts = [event for event in events if event[0] == "start"]
+        self.assertTrue(any(len(event[2]) >= 2 for event in starts))
+
+        def at(kind, name):
+            return next(index for index, event in enumerate(events) if event[0] == kind and event[1] == name)
+
+        self.assertGreater(at("start", "spend"), at("end", "stripe"))
+        self.assertGreater(at("start", "daily"), at("end", "usage_status"))
+
+    def test_a_rejected_session_does_not_start_the_second_wave(self):
+        names = []
+
+        def fetch(name, _url, _body, _timeout):
+            names.append(name)
+            if name == "usage":
+                return json.dumps({"error": "not_authenticated"})
+            return "{}"
+
+        with self.assertRaises(cursor_usage.CursorError):
+            cursor_usage.fetch_dashboard(fetch)
+        self.assertNotIn("spend", names)
+        self.assertNotIn("daily", names)
+
+    def test_cached_report_paints_before_the_collector(self):
+        result = subprocess.run(
+            ["node", str(ROOT / "tests" / "cache_order.mjs")],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
 
 if __name__ == "__main__":

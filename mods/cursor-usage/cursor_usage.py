@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -813,6 +814,80 @@ def read_db(db_path):
         connection.close()
 
 
+def _wave(fetch, calls):
+    """Run one wave together. Each call is (name, url, body, timeout)."""
+    if not calls:
+        return {}
+    if len(calls) == 1:
+        name, url, body, timeout = calls[0]
+        return {name: fetch(name, url, body, timeout)}
+    results = {}
+    with ThreadPoolExecutor(max_workers=len(calls)) as pool:
+        futures = {
+            pool.submit(fetch, name, url, body, timeout): name
+            for name, url, body, timeout in calls
+        }
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+    return results
+
+
+def fetch_dashboard(fetch):
+    """Ask Cursor for the dashboard payloads.
+
+    `fetch(name, url, body, timeout)` returns response text. The first wave
+    runs together. Team spend waits for stripe, and the token chart waits for
+    usage-status, so those two start only after the first wave returns.
+    """
+    texts = _wave(fetch, [
+        ("usage", "https://www.cursor.com/api/usage", None, 15),
+        ("stripe", "https://www.cursor.com/api/auth/stripe", None, 15),
+        ("period", "https://www.cursor.com/api/dashboard/get-current-period-usage", "{}", 30),
+        ("plan", "https://www.cursor.com/api/dashboard/get-plan-info", "{}", 30),
+        ("usage_status", "https://www.cursor.com/api/dashboard/v2/usage-status?scope=user", None, 30),
+        ("analytics", "https://www.cursor.com/api/dashboard/get-user-analytics", "{}", 30),
+    ])
+    usage_text = texts["usage"]
+    usage = safe_load(usage_text) if str(usage_text).strip() else {}
+    message = api_error_message(usage)
+    if message:
+        fail(message)
+    if not str(usage_text).strip() or not usage:
+        fail("Cursor API did not respond")
+    stripe = safe_load(texts["stripe"])
+    period = safe_load(texts["period"])
+    plan = safe_load(texts["plan"])
+    usage_status = safe_load(texts["usage_status"])
+    analytics = safe_load(texts["analytics"])
+    wave2 = []
+    team_id = stripe.get("teamId")
+    if team_id not in (None, ""):
+        wave2.append((
+            "spend",
+            "https://www.cursor.com/api/dashboard/get-team-spend",
+            json.dumps({"teamId": team_id}),
+            30,
+        ))
+    monthly = usage_status.get("monthlyUsage") if isinstance(usage_status, dict) else None
+    if isinstance(monthly, dict) and monthly.get("periodStart") and monthly.get("resetsAt"):
+        wave2.append((
+            "daily",
+            "https://www.cursor.com/api/dashboard/v2/query-daily-usage",
+            json.dumps({
+                "scope": "user",
+                "startTime": monthly["periodStart"],
+                "endTime": monthly["resetsAt"],
+                "groupBy": ["product"],
+                "topN": 5,
+            }),
+            30,
+        ))
+    texts2 = _wave(fetch, wave2)
+    spend = safe_load(texts2["spend"]) if "spend" in texts2 else {}
+    daily_usage = safe_load(texts2["daily"]) if "daily" in texts2 else {}
+    return usage, stripe, period, plan, spend, usage_status, analytics, daily_usage
+
+
 def fetch_live(db_path=DB_PATH):
     local = read_db(Path(db_path))
     if not str(local["token"]).strip():
@@ -820,42 +895,9 @@ def fetch_live(db_path=DB_PATH):
     cookie_value = session_cookie(str(local["token"]))
     jar = write_cookie_jar(cookie_value)
     try:
-        usage_text = curl(jar, "https://www.cursor.com/api/usage")
-        usage = safe_load(usage_text) if usage_text.strip() else {}
-        message = api_error_message(usage)
-        if message:
-            fail(message)
-        if not usage_text.strip() or not usage:
-            fail("Cursor API did not respond")
-        stripe = safe_load(curl(jar, "https://www.cursor.com/api/auth/stripe"))
-        period = safe_load(curl(jar, "https://www.cursor.com/api/dashboard/get-current-period-usage", "{}", 30))
-        plan = safe_load(curl(jar, "https://www.cursor.com/api/dashboard/get-plan-info", "{}", 30))
-        team_id = stripe.get("teamId")
-        spend = {}
-        if team_id not in (None, ""):
-            spend = safe_load(curl(
-                jar,
-                "https://www.cursor.com/api/dashboard/get-team-spend",
-                json.dumps({"teamId": team_id}),
-                30,
-            ))
-        usage_status = safe_load(curl(jar, "https://www.cursor.com/api/dashboard/v2/usage-status?scope=user", None, 30))
-        analytics = safe_load(curl(jar, "https://www.cursor.com/api/dashboard/get-user-analytics", "{}", 30))
-        daily_usage = {}
-        monthly = usage_status.get("monthlyUsage") if isinstance(usage_status, dict) else None
-        if isinstance(monthly, dict) and monthly.get("periodStart") and monthly.get("resetsAt"):
-            daily_usage = safe_load(curl(
-                jar,
-                "https://www.cursor.com/api/dashboard/v2/query-daily-usage",
-                json.dumps({
-                    "scope": "user",
-                    "startTime": monthly["periodStart"],
-                    "endTime": monthly["resetsAt"],
-                    "groupBy": ["product"],
-                    "topN": 5,
-                }),
-                30,
-            ))
+        usage, stripe, period, plan, spend, usage_status, analytics, daily_usage = fetch_dashboard(
+            lambda _name, url, body, timeout: curl(jar, url, body, timeout),
+        )
     finally:
         jar.unlink(missing_ok=True)
     return build_report(
